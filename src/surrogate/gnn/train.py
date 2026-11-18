@@ -1,0 +1,359 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, roc_auc_score
+
+from src.surrogate.features.consts import CLASS_TASK
+from src.surrogate.gnn.dataset import CAT_COLS, NUM_COLS, GNNDataConfig, build_dataloaders
+from src.surrogate.gnn.graph_data import (
+    ROOM_GRAPH_FEATURE_VERSION,
+    LayoutGraphCacheConfig,
+    build_layout_graph_cache,
+)
+from src.surrogate.gnn.model import LayoutParamGNN, auto_param_emb_dims
+
+
+@dataclass(frozen=True)
+class GNNTrainConfig:
+    dataset_path: str = r"data\parametric\surrogate_dataset\splits\surrogate_samples_with_splits.parquet"
+    layout_json_dir: str = r"data\dxf\cad_json_data\fem_raw"
+    layout_dxf_dir: str = r"data\dxf\fem_raw"
+    graph_cache_dir: str = r"data\parametric\surrogate_dataset\gnn_graph_cache"
+    graph_repr: str = "member"
+    output_dir: str = r"data\parametric\surrogate_dataset\baseline_gnn_final_pass"
+    seed: int = 42
+    batch_size: int = 128
+    max_epochs: int = 50
+    early_stop_rounds: int = 10
+    lr: float = 1.0e-3
+    weight_decay: float = 1.0e-4
+    lr_scheduler: bool = False
+    lr_scheduler_patience: int = 2
+    lr_scheduler_factor: float = 0.5
+    hidden_dim: int = 128
+    gnn_layers: int = 3
+    conv_type: str = "sage"
+    dropout: float = 0.2
+    num_workers: int = 0
+    log_interval: int = 1
+    monitor_metric: str = "pr_auc"
+    screening_target_recall: float = 0.99
+    rebuild_graph_cache: bool = False
+    merge_members: bool = True
+
+
+def run_gnn_train(cfg: GNNTrainConfig) -> dict[str, object]:
+    _set_seed(cfg.seed)
+
+    if cfg.rebuild_graph_cache or _needs_graph_cache_rebuild(cfg):
+        build_layout_graph_cache(
+            LayoutGraphCacheConfig(
+                layout_json_dir=cfg.layout_json_dir,
+                layout_dxf_dir=cfg.layout_dxf_dir,
+                output_dir=cfg.graph_cache_dir,
+                graph_repr=cfg.graph_repr,
+                merge_members=cfg.merge_members,
+            )
+        )
+
+    loaders, pre, (node_dim, edge_dim, graph_feat_dim) = build_dataloaders(
+        GNNDataConfig(
+            dataset_path=cfg.dataset_path,
+            graph_cache_dir=cfg.graph_cache_dir,
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers,
+        )
+    )
+
+    cat_cardinalities = [len(pre.cat_vocab[c]) for c in CAT_COLS]
+    emb_dims = auto_param_emb_dims(cat_cardinalities)
+
+    model = LayoutParamGNN(
+        node_dim=node_dim,
+        edge_dim=edge_dim,
+        graph_feat_dim=graph_feat_dim,
+        param_num_dim=len(NUM_COLS),
+        param_cat_cardinalities=cat_cardinalities,
+        param_emb_dims=emb_dims,
+        hidden_dim=cfg.hidden_dim,
+        gnn_layers=cfg.gnn_layers,
+        dropout=cfg.dropout,
+        conv_type=cfg.conv_type,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+    pos_weight = _estimate_pos_weight(loaders["train"], device)
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = None
+    if cfg.lr_scheduler:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=cfg.lr_scheduler_factor,
+            patience=cfg.lr_scheduler_patience,
+        )
+
+    best_state = None
+    if cfg.monitor_metric not in {"pr_auc", "f1", "screen_reject"}:
+        raise ValueError(f"Unknown monitor_metric: {cfg.monitor_metric}")
+
+    best_score = -1.0
+    best_epoch = -1
+    bad_rounds = 0
+
+    for epoch in range(cfg.max_epochs):
+        train_loss = _train_one_epoch(model, loaders["train"], criterion, optimizer, device)
+        val_stat = _eval_binary(model, loaders["val"], device)
+        val_threshold = _find_best_f1_threshold(val_stat["y_true"], val_stat["y_prob"])
+        val_pred = (val_stat["y_prob"] >= val_threshold).astype(int)
+        val_f1 = float(f1_score(val_stat["y_true"], val_pred, zero_division=0))
+        screen_threshold, val_screen = _find_best_screening_threshold(
+            val_stat["y_true"], val_stat["y_prob"], cfg.screening_target_recall
+        )
+        if cfg.monitor_metric == "pr_auc":
+            monitor_score = float(val_stat["pr_auc"])
+        elif cfg.monitor_metric == "f1":
+            monitor_score = val_f1
+        else:
+            monitor_score = val_screen["reject_rate"]
+
+        if epoch == 0 or (epoch + 1) % max(cfg.log_interval, 1) == 0:
+            print(
+                f"[surrogate][gnn] epoch={epoch + 1}/{cfg.max_epochs} "
+                f"train_loss={train_loss:.6f} val_pr_auc={val_stat['pr_auc']:.6f} "
+                f"val_f1={val_f1:.6f} val_screen_reject={val_screen['reject_rate']:.6f} "
+                f"val_screen_thr={screen_threshold:.4f} best_{cfg.monitor_metric}={best_score:.6f}"
+            )
+
+        if monitor_score > best_score:
+            best_score = monitor_score
+            best_epoch = epoch
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad_rounds = 0
+        else:
+            bad_rounds += 1
+            if bad_rounds >= cfg.early_stop_rounds:
+                print(
+                    f"[surrogate][gnn] early_stop epoch={epoch + 1} "
+                    f"best_epoch={best_epoch + 1} best_{cfg.monitor_metric}={best_score:.6f}"
+                )
+                break
+        if scheduler is not None:
+            scheduler.step(monitor_score)
+
+    if best_state is None:
+        raise RuntimeError("GNN failed to produce a valid checkpoint")
+
+    model.load_state_dict(best_state)
+
+    val_stat = _eval_binary(model, loaders["val"], device)
+    threshold = _find_best_f1_threshold(val_stat["y_true"], val_stat["y_prob"])
+    screening_threshold, val_screen = _find_best_screening_threshold(
+        val_stat["y_true"], val_stat["y_prob"], cfg.screening_target_recall
+    )
+
+    test_stat = _eval_binary(model, loaders["test"], device)
+    test_pred = (test_stat["y_prob"] >= threshold).astype(int)
+    test_screen = _screening_metrics(test_stat["y_true"], test_stat["y_prob"], screening_threshold)
+
+    out_dir = Path(cfg.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    torch.save(
+        {
+            "state_dict": model.cpu().state_dict(),
+            "model_cfg": {
+                "node_dim": node_dim,
+                "edge_dim": edge_dim,
+                "graph_feat_dim": graph_feat_dim,
+                "param_num_dim": len(NUM_COLS),
+                "param_cat_cardinalities": cat_cardinalities,
+                "param_emb_dims": emb_dims,
+                "hidden_dim": cfg.hidden_dim,
+                "gnn_layers": cfg.gnn_layers,
+                "dropout": cfg.dropout,
+                "conv_type": cfg.conv_type,
+            },
+            "preprocess": pre.export(),
+            "threshold": float(threshold),
+            "screening_threshold": float(screening_threshold),
+            "screening_target_recall": float(cfg.screening_target_recall),
+        },
+        out_dir / "gnn_final_pass.pt",
+    )
+
+    test_df = pd.read_parquet(cfg.dataset_path)
+    test_df = test_df[test_df["split"] == "test"].copy().reset_index(drop=True)
+    pred_df = test_df[["layout_id", "sample_id", CLASS_TASK]].copy()
+    pred_df = pred_df.rename(columns={CLASS_TASK: "final_pass_true"})
+    pred_df["pred_final_pass_prob"] = test_stat["y_prob"]
+    pred_df["pred_final_pass"] = test_pred
+    pred_df.to_parquet(out_dir / "predictions_test.parquet", index=False)
+
+    metrics = {
+        "config": asdict(cfg),
+        "best_epoch": int(best_epoch),
+        "threshold": float(threshold),
+        "screening_threshold": float(screening_threshold),
+        "val": _binary_metrics(
+            val_stat["y_true"], val_stat["y_prob"], (val_stat["y_prob"] >= threshold).astype(int)
+        ),
+        "test": _binary_metrics(test_stat["y_true"], test_stat["y_prob"], test_pred),
+        "screening": {
+            "target_recall": float(cfg.screening_target_recall),
+            "val": val_screen,
+            "test": test_screen,
+        },
+    }
+    (out_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=True, indent=2), encoding="utf-8")
+    return metrics
+
+
+def _estimate_pos_weight(loader, device: torch.device) -> torch.Tensor:
+    pos = 0.0
+    total = 0.0
+    for batch in loader:
+        y = batch.y.detach().cpu().numpy()
+        pos += float(y.sum())
+        total += float(len(y))
+    neg = max(total - pos, 1.0)
+    return torch.tensor(neg / max(pos, 1.0), dtype=torch.float32, device=device)
+
+
+def _train_one_epoch(model, loader, criterion, optimizer, device: torch.device) -> float:
+    model.train()
+    losses = []
+    total_batches = len(loader)
+    for i, batch in enumerate(loader):
+        batch = batch.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(batch)
+        loss = criterion(logits, batch.y)
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.detach().cpu().item()))
+        if (i + 1) % 50 == 0 or (i + 1) == total_batches:
+            print(f"\rbatch: {i + 1}/{total_batches}, Loss: {losses[-1]:.4f}", flush=True, end="")
+    return float(np.mean(losses)) if losses else 0.0
+
+
+def _eval_binary(model, loader, device: torch.device) -> dict[str, np.ndarray | float]:
+    model.eval()
+    ys = []
+    probs = []
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+            logits = model(batch)
+            prob = torch.sigmoid(logits)
+            ys.append(batch.y.detach().cpu().numpy())
+            probs.append(prob.detach().cpu().numpy())
+
+    y_true = np.concatenate(ys, axis=0).astype(np.int64)
+    y_prob = np.concatenate(probs, axis=0).astype(np.float64)
+    pr_auc = float(average_precision_score(y_true, y_prob)) if len(np.unique(y_true)) > 1 else 0.5
+    return {"y_true": y_true, "y_prob": y_prob, "pr_auc": pr_auc}
+
+
+def _binary_metrics(y_true: np.ndarray, y_prob: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    out = {
+        "samples": float(len(y_true)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+    }
+    if len(np.unique(y_true)) > 1:
+        out["roc_auc"] = float(roc_auc_score(y_true, y_prob))
+        out["pr_auc"] = float(average_precision_score(y_true, y_prob))
+    return out
+
+
+def _find_best_f1_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    best_thr = 0.5
+    best_f1 = -1.0
+    for thr in np.arange(0.05, 0.96, 0.01):
+        y_pred = (y_prob >= thr).astype(int)
+        score = f1_score(y_true, y_pred, zero_division=0)
+        if score > best_f1:
+            best_f1 = float(score)
+            best_thr = float(thr)
+    return best_thr
+
+
+def _find_best_screening_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    target_recall: float,
+) -> tuple[float, dict[str, float]]:
+    best_thr = 0.0
+    best_metrics = _screening_metrics(y_true, y_prob, best_thr)
+    for thr in np.arange(0.0, 1.001, 0.002):
+        metrics = _screening_metrics(y_true, y_prob, float(thr))
+        if metrics["feasible_recall"] < target_recall:
+            continue
+        if metrics["reject_rate"] > best_metrics["reject_rate"]:
+            best_thr = float(thr)
+            best_metrics = metrics
+    return best_thr, best_metrics
+
+
+def _screening_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> dict[str, float]:
+    feasible = y_true.astype(bool)
+    reject = y_prob < threshold
+    keep = ~reject
+
+    feasible_count = max(int(feasible.sum()), 1)
+    reject_count = max(int(reject.sum()), 1)
+    keep_count = max(int(keep.sum()), 1)
+
+    false_reject = reject & feasible
+    true_reject = reject & ~feasible
+    kept_feasible = keep & feasible
+
+    return {
+        "threshold": float(threshold),
+        "reject_rate": float(reject.mean()),
+        "keep_rate": float(keep.mean()),
+        "feasible_recall": float(kept_feasible.sum() / feasible_count),
+        "false_reject_rate": float(false_reject.sum() / feasible_count),
+        "false_reject_count": float(false_reject.sum()),
+        "reject_infeasible_precision": float(true_reject.sum() / reject_count),
+        "kept_feasible_rate": float(kept_feasible.sum() / keep_count),
+    }
+
+
+def _set_seed(seed: int) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _needs_graph_cache_rebuild(cfg: GNNTrainConfig) -> bool:
+    cache_dir = Path(cfg.graph_cache_dir)
+    if not cache_dir.exists():
+        return True
+
+    summary_path = cache_dir / "summary.json"
+    if not summary_path.exists():
+        return cfg.graph_repr != "member"
+
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return True
+
+    if summary.get("graph_representation", "member") != cfg.graph_repr:
+        return True
+    if cfg.graph_repr == "room" and summary.get("feature_version") != ROOM_GRAPH_FEATURE_VERSION:
+        return True
+    return False
