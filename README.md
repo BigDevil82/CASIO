@@ -1,18 +1,98 @@
-# CASIO
+# CASIO: Calibrated Surrogate-Informed Optimization for Shear Wall Structural Design
 
-CASIO（Calibrated Surrogate-Informed Optimization）是面向剪力墙截面与材料选型的代理辅助优化方法。它用两套独立训练的 FuseGNN 分别估计候选方案的可行性与配筋质量，再用当前建筑的有限元分析（FEA）结果更新局部校准模型。校准结果用于可行性筛选、材料成本排序和 FEA 名额分配，最终方案仍由 FEA 和结构验算确定。
+Official implementation of **CASIO** (*Calibrated Surrogate-Informed Optimization*), a surrogate-informed framework for FEA-efficient section sizing and material selection in high-rise shear wall structures.
 
-本仓库包含 CASIO 的核心 Python 实现和命令行入口。论文专用绘图、批量对比实验、排版文件、数据、模型权重和实验产物均不随仓库提供。此次仅整理源码，尚未安装依赖或验证运行。
+## Overview
 
-| 模块 | 源码入口 |
-| --- | --- |
-| 结构建模、OpenSees 分析与配筋验算 | [`src/shearwall_modeling/`](src/shearwall_modeling/)、[`scripts/shearwall_analyzer_main.py`](scripts/shearwall_analyzer_main.py) |
-| FEA 样本生成与布局特征准备 | [`scripts/parametric_dataset.py`](scripts/parametric_dataset.py)、`scripts/surrogate/` 下的 `prepare_dataset.py`、`build_layout_features.py` 和 `make_group_splits.py` |
-| FuseGNN 训练与推理 | [`src/surrogate/gnn/`](src/surrogate/gnn/)、`scripts/surrogate/` 下的 `train_gnn_final_pass.py`、`train_gnn_steel.py` 和 `predict_gnn_final_pass.py`。实现中的 `LayoutParamGNN` 是论文中的 FuseGNN。 |
-| 在线校准与优化 | [`src/shearwall_optimization/`](src/shearwall_optimization/)，包含候选筛选、成本预选、在线校准、GA、PSO 和随机搜索；统一入口为 [`scripts/shearwall_optimize_main.py`](scripts/shearwall_optimize_main.py) |
+CASIO accelerates shear wall sizing for a prescribed structural layout, subject to the design checks implemented in this repository. It has three core components:
 
-`src/data_engine/`、`src/shearwall_pred/` 和 `src/misc/` 仅保留上述代码引用的共享模块。部分脚本仍使用原项目的工作目录约定，后续调试时应从仓库根目录执行，并按入口参数指定自己的输入文件。
+1. **Layout-Conditioned Global Surrogates (`FuseGNN`)**: Two independently trained graph-tabular networks (`LayoutParamGNN` in the codebase) combine room-adjacency graphs, global layout statistics, and design parameters to predict feasibility and reinforcement mass before finite element analysis (FEA).
+2. **Online Local Calibration**: During optimization, FEA results from the target building update local calibrators without retraining the global networks. The feasibility calibrator uses Platt scaling. The reinforcement calibrator predicts residuals using ridge regression, Gaussian process regression, or LightGBM, depending on the number of available samples.
+3. **Decision-Oriented FEA Allocation**: Calibrated predictions guide conservative feasibility screening and feasibility-adjusted cost ranking to prioritize candidates for OpenSees evaluation. The workflow supports GA, PSO, and random search. Final designs are evaluated with FEA and the implemented design checks.
 
-原项目使用 Python 3.12。主要依赖包括 PyTorch、PyTorch Geometric、OpenSeesPy、NumPy、pandas、PyArrow（Parquet）、scikit-learn、NetworkX、Shapely、ezdxf 和 Matplotlib。部分优化和辅助模块还使用 LightGBM、Optuna、joblib 和 tqdm；此处不锁定依赖版本。
+## Repository Structure
 
-接回原有资产时，训练通常需要 `data/dxf/cad_json_data/fem_raw/` 的布局 JSON、`data/dxf/fem_raw/` 的 DXF 和 `data/parametric/surrogate_dataset/splits/` 的分组样本。优化和评估还需要 `data/parametric/ckpt/` 下的对应模型工件。这些路径是原脚本的默认约定，仓库中没有附带相应文件。
+```text
+CASIO/
+├── src/
+│   ├── shearwall_modeling/      # Parametric modeling, OpenSees FEA, and reinforcement checks
+│   ├── surrogate/              # FuseGNN, feature extraction, and dataset preparation
+│   ├── shearwall_optimization/  # Screening, ranking, online calibration, and search algorithms
+│   ├── data_engine/             # Shared geometry and graph processing
+│   ├── shearwall_pred/          # Shared graph construction helpers
+│   └── misc/                    # Common utilities
+└── scripts/
+    ├── shearwall_analyzer_main.py       # Example driver for single-design FEA and checks
+    ├── parametric_dataset.py            # Parametric sampling and batch FEA
+    ├── shearwall_optimize_main.py       # CASIO and full-FEA optimization entry point
+    └── surrogate/
+        ├── prepare_dataset.py           # Convert FEA results to surrogate training records
+        ├── build_layout_features.py     # Compute and merge global layout statistics
+        ├── make_group_splits.py         # Split records by layout for training, validation, and testing
+        ├── train_gnn_final_pass.py      # Train the feasibility classifier
+        ├── train_gnn_steel.py           # Train the reinforcement mass regressor
+        └── predict_gnn_final_pass.py    # Run and evaluate feasibility classifier inference
+```
+
+## Environment & Dependencies
+
+The source project uses **Python 3.12**. This standalone repository has not yet been validated end to end. Install PyTorch for your CPU or CUDA environment, then install the remaining dependencies:
+
+```bash
+pip install torch_geometric openseespy numpy pandas pyarrow scikit-learn lightgbm optuna networkx shapely ezdxf matplotlib joblib tqdm
+```
+
+## Data & Directory Conventions
+
+Engineering drawings, FEA datasets, and pretrained model artifacts are not included. The inherited defaults use Windows-style paths. On other platforms, pass paths explicitly. Run commands from the repository root.
+
+- `data/dxf/cad_json_data/fem_raw/`: layout JSON files in the format expected by the structural evaluator and room-graph builder.
+- `data/dxf/fem_raw/`: matching DXF files for the optional member-graph representation. Room graphs are built from the layout JSON alone.
+- `data/parametric/surrogate_dataset/splits/`: Parquet records split by layout.
+- `data/parametric/ckpt/`: the optimization CLI's default location for surrogate artifacts. Training writes artifacts under `data/parametric/surrogate_dataset/` by default. Pass the files produced by training explicitly when running optimization.
+
+## Quick Start
+
+Use `python -m <module> --help` from the repository root to inspect the arguments for the commands below. `scripts/shearwall_analyzer_main.py` is an example driver with a preset JSON path and does not implement `--help`.
+
+The following commands show the workflow using the inherited Windows defaults. They require local input data and have not been run end to end in this repository.
+
+```bash
+# 1. Generate FEA samples and prepare the training dataset.
+python -m scripts.parametric_dataset
+python -m scripts.surrogate.prepare_dataset --source-dir outputs/result/parametric_dataset
+python -m scripts.surrogate.build_layout_features
+python -m scripts.surrogate.make_group_splits
+
+# 2. Train the two surrogates using room graphs.
+python -m scripts.surrogate.train_gnn_final_pass --graph-repr room
+python -m scripts.surrogate.train_gnn_steel --graph-repr room
+```
+
+These commands show the room-graph workflow; the training hyperparameter defaults differ from the paper settings.
+
+To enable CASIO with GA, pass your layout, both trained artifacts, and the room-graph cache generated during training. The cache and layout statistics must contain the target layout. If you stored the layout statistics outside the default location, pass the file with `--ga-surrogate-layout-features` and `--ga-cost-layout-features`. The same surrogate options apply to `pso` and `random` despite the `--ga-` prefix.
+
+```bash
+python -m scripts.shearwall_optimize_main --algorithm ga --layout-path path/to/layout.json \
+  --ga-surrogate-screen --ga-surrogate-artifact path/to/gnn_final_pass.pt \
+  --ga-surrogate-cost-preselect --ga-cost-steel-artifact path/to/gnn_steel.pt \
+  --ga-surrogate-graph-cache data/parametric/surrogate_dataset/gnn_room_graph_cache \
+  --ga-cost-graph-cache data/parametric/surrogate_dataset/gnn_room_graph_cache \
+  --ga-local-calibration
+```
+
+For a full-FEA baseline, omit the surrogate and calibration flags.
+
+## Citation
+
+If you use this code or methodology in your research, please cite the manuscript:
+
+```bibtex
+@unpublished{Leng2026CASIO,
+  title  = {A Calibrated Surrogate-Informed Optimization Framework for FEA-Efficient Shear Wall Structural Design},
+  author = {Leng, Hao and Gao, Yuqing and Zhou, Ying and Zhang, Zheng},
+  year   = {2026},
+  note   = {Manuscript under review}
+}
+```
